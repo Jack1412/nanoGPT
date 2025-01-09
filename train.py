@@ -114,21 +114,50 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
 def get_batch(split):
+    '''
+        Desc: 数据加载器，它每次调用时都会从内存映射的数据集中随机获取一个新的批次数据, 并将其转换为PyTorch张量, 
+              然后根据设备类型将其传输到GPU或CPU. 这种设计有助于避免内存泄漏,并允许高效地处理大型数据集。
+        split: 'train'或'val'
+        x,y: 函数返回x和y两个张量, 它们分别代表输入和目标输出
+    '''
     # We recreate np.memmap every batch to avoid a memory leak, as per
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
+    # 使用np.memmap创建一个内存映射对象data。这个对象将映射到磁盘上的'train.bin'或'val.bin'文件，允许高效地访问大型数据集而不需要一次性加载整个数据集到内存中。
     if split == 'train':
         data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
     else:
         data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+    # 随机索引数组ix, 大小为(batch_size,), -block_size应该是因为索引会切片 block_size 大小
     ix = torch.randint(len(data) - block_size, (batch_size,))
+    # 取 batch_size 个 长度为 block_size 的序列
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
+    # y是对应x的下一个block_size长度的序列，用于训练语言模型时的目标输出
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
     if device_type == 'cuda':
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
+        # 将数据预先分配到pinned memory，以便异步传输到GPU。
         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
     else:
         x, y = x.to(device), y.to(device)
     return x, y
+
+# 模型初始化部分的代码主要完成了以下任务：
+
+#     初始化训练状态（iter_num和best_val_loss）。
+
+#     从数据集的元数据文件中读取词汇表大小。
+
+#     根据配置参数初始化模型：
+
+#         从零开始训练。
+
+#         从检查点恢复训练。
+
+#         从预训练的GPT-2模型初始化。
+
+#     裁剪模型的block_size（如果需要）。
+
+#     将模型移动到指定设备。
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
@@ -214,6 +243,9 @@ if ddp:
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
 def estimate_loss():
+    '''
+        在训练集和验证集上估计损失
+    '''
     out = {}
     model.eval()
     for split in ['train', 'val']:
@@ -247,6 +279,20 @@ if wandb_log and master_process:
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 # training loop
+# 训练循环部分的代码主要完成了以下任务：
+
+#     获取训练数据批次。
+
+#     根据当前迭代次数计算学习率，并更新优化器。
+
+#     定期评估训练和验证损失，并保存检查点。
+
+#     执行前向传播、反向传播和梯度更新。
+
+#     记录训练日志，包括损失、耗时和模型利用率（MFU）。
+
+#     检查终止条件，如果达到最大迭代次数则退出循环。
+# X是输入序列，Y是目标序列
 X, Y = get_batch('train') # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
@@ -289,6 +335,7 @@ while True:
 
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
+    # 开始梯度累积循环 梯度累积用于模拟更大的批次大小
     for micro_step in range(gradient_accumulation_steps):
         if ddp:
             # in DDP training we only need to sync gradients at the last micro step.
@@ -298,14 +345,17 @@ while True:
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
             logits, loss = model(X, Y)
+            # 将损失除以梯度累积步数，以在累积过程中保持损失的正确比例
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
     # clip the gradient
+    # 如果启用了梯度裁剪, 取消梯度缩放
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)
+        # 裁剪梯度，防止梯度爆炸
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
     # step the optimizer and scaler if training in fp16
     scaler.step(optimizer)
@@ -320,6 +370,7 @@ while True:
     if iter_num % log_interval == 0 and master_process:
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
+        # 计算当前的总损失（乘以梯度累积步数）
         lossf = loss.item() * gradient_accumulation_steps
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)

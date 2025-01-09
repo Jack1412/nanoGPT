@@ -39,6 +39,8 @@ if init_from == 'resume':
     gptconf = GPTConfig(**checkpoint['model_args'])
     model = GPT(gptconf)
     state_dict = checkpoint['model']
+    # torch.compile will add a prefix ‘_orig_mod.’ to state_dict() of the model
+    # delete prefix to success load model
     unwanted_prefix = '_orig_mod.'
     for k,v in list(state_dict.items()):
         if k.startswith(unwanted_prefix):

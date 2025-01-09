@@ -16,6 +16,7 @@ comes up with a better simple Python solution I am all ears.
 
 import sys
 from ast import literal_eval
+# literal_eval 将字符串安全地转换为Python字面量表达式的值。它可以处理字符串、数字、元组、列表、字典和布尔值等常见的Python数据类型
 
 for arg in sys.argv[1:]:
     if '=' not in arg:
